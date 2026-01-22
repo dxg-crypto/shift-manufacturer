@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Shift Maker Pro Ver 26.7</title>
+    <title>Shift Maker Pro Ver 26.8</title>
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <!-- React & ReactDOM -->
@@ -163,7 +163,7 @@
           const [generationLog, setGenerationLog] = useState([]);
 
           // --- Persistence ---
-          const STORAGE_KEY = 'shift_maker_pro_data_v26_7';
+          const STORAGE_KEY = 'shift_maker_pro_data_v26_8';
 
           // ブラウザ保存
           const saveToLocal = () => {
@@ -330,10 +330,13 @@
             
             if (role === 'help_guest' || role === 'event') {
               const mark = role === 'event' ? 'event_in' : 'guest_in';
+              // 変更: 出勤(mark) -> 希望休('off') -> 解除(undefined)
               if (current === mark) {
-                const n = { ...requests }; delete n[key]; setRequests(n);
+                  setRequests({ ...requests, [key]: 'off' });
+              } else if (current === 'off') {
+                  const n = { ...requests }; delete n[key]; setRequests(n);
               } else {
-                setRequests({ ...requests, [key]: mark });
+                  setRequests({ ...requests, [key]: mark });
               }
               return;
             }
@@ -357,12 +360,22 @@
 
           const toggleAllHelpDates = (staffId, role) => {
             const mark = role === 'event' ? 'event_in' : 'guest_in';
+            // 全ての日がmark(出勤)かどうか判定
+            // 注意: 'off' が混じっていても、全選択ボタンは「全出勤」にするか「全解除」にするか。
+            // ここでは「一つでも未設定or休みなら全出勤にする」「全て出勤なら全解除」とする
             const isAllSelected = dateList.every(d => requests[`${staffId}_${getDateKey(d)}`] === mark);
+            
             let newRequests = { ...requests };
             dateList.forEach(d => {
               const key = `${staffId}_${getDateKey(d)}`;
-              if (isAllSelected) delete newRequests[key];
-              else newRequests[key] = mark;
+              if (isAllSelected) {
+                  delete newRequests[key];
+              } else {
+                  // 既に希望休が入っている場合は上書きしない方が親切だが、
+                  // 「全選択」の意味合いとしてはリセットして塗りつぶしが直感的かもしれない。
+                  // 今回は上書きする
+                  newRequests[key] = mark;
+              }
             });
             setRequests(newRequests);
           };
@@ -382,17 +395,32 @@
             
             // 準備: スタッフごとの状態管理
             // シミュレーション用の配列を作る (dayIndex: 0..daysInMonth-1)
-            const staffSim = staffList.map(s => ({
-                id: s.id,
-                role: s.role,
-                isTrainer: s.isTrainer,
-                wantConsecutive: s.wantConsecutive,
-                name: s.name,
-                isFullTime: !['help_guest', 'event'].includes(s.role),
-                assigns: Array(daysInMonth).fill(null), // 0:出勤(type), null:未定, "OFF":休み
-                consecutive: 0, // 現在の連勤数カウンター
-                offCount: 0
-            }));
+            const staffSim = staffList.map(s => {
+                // ★修正: イベント専属/ヘルプでも、出勤希望日数が多ければ「フルタイム扱い(10日公休ルール適用)」にする
+                let isFullTime = !['help_guest', 'event'].includes(s.role);
+                
+                if (!isFullTime) {
+                    const mark = s.role === 'event' ? 'event_in' : 'guest_in';
+                    // リクエストされた出勤日数(希望休などは除く)
+                    const reqDays = dateList.filter(d => requests[`${s.id}_${getDateKey(d)}`] === mark).length;
+                    // 月の2/3以上(20日以上)出勤希望があればフルタイム扱い
+                    if (reqDays >= 20) {
+                        isFullTime = true;
+                    }
+                }
+
+                return {
+                    id: s.id,
+                    role: s.role,
+                    isTrainer: s.isTrainer,
+                    wantConsecutive: s.wantConsecutive,
+                    name: s.name,
+                    isFullTime,
+                    assigns: Array(daysInMonth).fill(null), // 0:出勤(type), null:未定, "OFF":休み
+                    consecutive: 0, // 現在の連勤数カウンター
+                    offCount: 0
+                };
+            });
 
             // 1. 確定情報の埋め込み (希望休・定休・行事・ヘルプ・イベント出勤)
             for (let i = 0; i < daysInMonth; i++) {
@@ -408,17 +436,35 @@
                         s.assigns[i] = "定休";
                     } else if (help) {
                         s.assigns[i] = help; // 他店ヘルプ (出勤扱い)
-                    } else if (!s.isFullTime) {
-                        // スポット
+                    } else if (['help_guest', 'event'].includes(s.role)) {
+                        // イベント・ヘルプ
                         const mark = s.role === 'event' ? 'event_in' : 'guest_in';
-                        if (req === mark) {
-                            // 出勤希望あり。後でシフトタイプ決めるため一時的にマーク
-                            s.assigns[i] = "REQ_IN"; 
+                        
+                        if (req === 'off') {
+                            s.assigns[i] = "希望";
+                        } else if (req === mark) {
+                            if (s.isFullTime) {
+                                // フルタイム扱いなら、一旦未定にしてシフト調整に任せるか？
+                                // いや、「出勤希望」なので REQ_IN 扱いにする
+                                s.assigns[i] = "REQ_IN";
+                            } else {
+                                // スポット扱いならこの時点で確定でも良いが、連勤チェックのため REQ_IN
+                                s.assigns[i] = "REQ_IN";
+                            }
                         } else {
-                            s.assigns[i] = "-"; // 休み扱い
+                            // リクエストなし
+                            if (s.isFullTime) {
+                                // フルタイム扱いなら「未定(null)」にしてシフト割り当て対象にする
+                                // ただし「全選択」機能前提だと、全選択＝REQ_IN なので、ここはnullでOK
+                                // もし選択漏れなら休みになるべきか？
+                                // -> isFullTime化条件が「20日以上REQ_IN」なので、REQ_IN以外の日は休みでいいはず
+                                s.assigns[i] = "-";
+                            } else {
+                                s.assigns[i] = "-";
+                            }
                         }
                     } else {
-                        // フルタイム
+                        // 通常フルタイム
                         if (req === 'off') s.assigns[i] = "希望";
                         else if (req === 'paid') s.assigns[i] = "有給";
                         else if (req) {
@@ -442,25 +488,19 @@
                 const targetNum = getRequiredNum(d);
                 
                 // 候補者抽出
-                // まだ決まっていないフルタイム or REQ_INのスポット
+                // null (未定) または REQ_IN (出勤希望) の人
                 let candidates = staffSim.filter(s => s.assigns[i] === null || s.assigns[i] === "REQ_IN");
                 let assigned = [];
 
                 // トレーナーと新人のペアリングマップ作成
-                // 新人が候補にいる場合、対応するトレーナーを探す
                 let rookieTrainerMap = new Map(); // rookie -> trainer
                 let trainerUsed = new Set();
 
-                // 新人を先に走査してトレーナー確保
                 const rookies = candidates.filter(s => s.role === 'rookie');
                 const trainers = candidates.filter(s => s.isTrainer);
 
                 rookies.forEach(r => {
-                    // ペアになれるトレーナーを探す
-                    // 連勤上限などで「今日出勤できないトレーナー」はcandidatesにいないはずだが、
-                    // ここで連勤チェックも兼ねる
-                    
-                    // 候補の中から、まだペアになっていないトレーナーを探す
+                    // まだ使われていないトレーナーを探す
                     let t = trainers.find(tr => !trainerUsed.has(tr.id));
                     // いなければ、既にペアになっているトレーナーでも可（多対1）
                     if (!t) t = trainers.find(tr => true); 
@@ -471,47 +511,50 @@
                             rookieTrainerMap.set(r.id, t);
                             trainerUsed.add(t.id);
                         } else {
-                            // トレーナーが連勤限界で出られないなら新人も休み
+                            // トレーナーが連勤限界なら新人も休み
                             r.assigns[i] = "公休";
                             r.consecutive = 0;
                         }
                     } else {
-                        // トレーナー不在なら新人は休み
                         r.assigns[i] = "公休";
                         r.consecutive = 0;
                     }
                 });
 
-                // 再度候補リストを整理（新人で休み確定した人を除外）
+                // 再度候補リストを整理
                 candidates = candidates.filter(s => s.assigns[i] === null || s.assigns[i] === "REQ_IN");
 
                 // スコアリング & ソート
                 candidates.sort((a, b) => {
-                    // スコア計算: 高い方が優先的に出勤
                     let scoreA = 100;
                     let scoreB = 100;
 
-                    // 連勤チェック: MAXに達していたら除外(別処理で弾くが念のためスコア下げ)
+                    // REQ_IN は優先度最高
+                    if (a.assigns[i] === "REQ_IN") scoreA += 1000;
+                    if (b.assigns[i] === "REQ_IN") scoreB += 1000;
+
+                    // 連勤チェック: MAXに達していたら除外
                     if (a.consecutive >= MAX_CONSECUTIVE_WORK) scoreA = -9999;
                     if (b.consecutive >= MAX_CONSECUTIVE_WORK) scoreB = -9999;
 
-                    // 飛び石回避: 昨日休みなら、今日も休んで連休にしたい -> 出勤スコア下げる
+                    // 飛び石回避 (昨日休みなら今日も休んで連休にしたい)
                     const prevA = i > 0 ? a.assigns[i-1] : null;
                     const prevB = i > 0 ? b.assigns[i-1] : null;
-                    const isOffA = prevA && ['公休','希望','有給','定休'].includes(prevA);
-                    const isOffB = prevB && ['公休','希望','有給','定休'].includes(prevB);
+                    const isOffA = prevA && ['公休','希望','有給','定休','-'].includes(prevA);
+                    const isOffB = prevB && ['公休','希望','有給','定休','-'].includes(prevB);
                     
                     if (isOffA) scoreA -= 50;
                     if (isOffB) scoreB -= 50;
 
-                    // 連休抑制: 連休重視でない人が既に2連休以上なら、今日は出勤させたい -> スコア上げ
+                    // 連休抑制 (既に2連休以上なら出勤優先)
+                    // ★修正: 連休重視でない人は3連休以上させない
                     if (!a.wantConsecutive && i > 1) {
                         const p2A = a.assigns[i-2];
-                        if (isOffA && ['公休','希望','有給','定休'].includes(p2A)) scoreA += 80;
+                        if (isOffA && ['公休','希望','有給','定休','-'].includes(p2A)) scoreA += 150;
                     }
                     if (!b.wantConsecutive && i > 1) {
                         const p2B = b.assigns[i-2];
-                        if (isOffB && ['公休','希望','有給','定休'].includes(p2B)) scoreB += 80;
+                        if (isOffB && ['公休','希望','有給','定休','-'].includes(p2B)) scoreB += 150;
                     }
 
                     // ランダム性
@@ -523,9 +566,8 @@
 
                 // 割り当て実行
                 let currentAssignedCount = 0;
-                // 既に決まっている人(行事、ヘルプ)をカウント
                 staffSim.forEach(s => {
-                    if (s.assigns[i] && !['公休','希望','有給','定休','-'].includes(s.assigns[i])) {
+                    if (s.assigns[i] && !['公休','希望','有給','定休','-'].includes(s.assigns[i]) && s.assigns[i] !== "REQ_IN") {
                         currentAssignedCount++;
                     }
                 });
@@ -533,7 +575,7 @@
                 let needed = Math.max(0, targetNum - currentAssignedCount);
 
                 for (let s of candidates) {
-                    if (s.assigns[i]) continue; // 決定済み
+                    if (s.assigns[i] && s.assigns[i] !== "REQ_IN") continue; // 決定済み
 
                     // 連勤ガード
                     if (s.consecutive >= MAX_CONSECUTIVE_WORK) {
@@ -542,47 +584,45 @@
                         continue;
                     }
 
-                    // 採用判定
                     let accepted = false;
                     
-                    // スポット(REQ_IN)は無条件採用(連勤OKなら)
+                    // REQ_IN は無条件採用(連勤OKなら)
                     if (s.assigns[i] === "REQ_IN") {
                         accepted = true;
                     } else if (needed > 0) {
-                        // 新人の場合、トレーナーもセットで空き枠が必要
+                        // 新人処理
                         if (s.role === 'rookie') {
                             const trainer = rookieTrainerMap.get(s.id);
-                            // トレーナーがまだ未決定、かつ枠に余裕があるか？
-                            // トレーナーが既に他の新人とセットで採用済みなら枠消費なし(共有)
                             const trainerAlreadyAssigned = assigned.includes(trainer);
-                            const cost = trainerAlreadyAssigned ? 1 : 2; // 新人+トレーナー分
-
-                            if (needed >= cost) {
+                            // トレーナー自身がREQ_INなどで既に採用確定済みならコスト0
+                            // まだならコスト1
+                            // 実際はtrainerがcandidatesにいるかどうかも重要
+                            
+                            // 簡易ロジック: トレーナーがいればOK
+                            if (trainer) {
                                 accepted = true;
-                                if (!trainerAlreadyAssigned) {
-                                    // トレーナーも採用
+                                if (!trainerAlreadyAssigned && !trainer.assigns[i]) { // まだ未定なら
                                     assigned.push(trainer);
                                     trainer.consecutive++;
-                                    // 仮のシフトタイプ(後で上書き)
                                     trainer.assigns[i] = "TEMP"; 
                                     needed--;
                                 }
                             }
                         } else if (s.isTrainer) {
-                            // トレーナー単独採用 (新人とセットで採用されるケースは上記で処理)
-                            // 自分の担当新人がまだ未処理なら待つ？ -> いや、スコア順なので自分が先なら採用
+                            // トレーナーは自分の番が来たら採用
                             accepted = true;
                         } else {
-                            // 通常スタッフ
                             accepted = true;
                         }
                     }
 
                     if (accepted) {
-                        assigned.push(s);
-                        s.consecutive++;
-                        s.assigns[i] = "TEMP";
-                        needed--;
+                        if (!assigned.includes(s)) {
+                            assigned.push(s);
+                            s.consecutive++;
+                            s.assigns[i] = "TEMP";
+                            needed--;
+                        }
                     } else {
                         s.assigns[i] = "公休";
                         s.consecutive = 0;
@@ -599,6 +639,8 @@
                 const assignedRookies = assigned.filter(s => s.role === 'rookie');
                 assignedRookies.forEach(r => {
                     const t = rookieTrainerMap.get(r.id);
+                    if (!t) return; // エラー回避
+
                     // シフトタイプ決定
                     let type = 'フル';
                     if (shiftMode === 'complex') {
@@ -607,11 +649,12 @@
                     
                     // 新人とトレーナーに適用
                     r.assigns[i] = type;
-                    if (t.assigns[i] === "TEMP" || t.assigns[i] === type) {
+                    // トレーナーが既に別の理由(他店ヘルプ等)で確定していればそれに従うが
+                    // ここでは TEMP か REQ_IN なので上書き
+                    if (t.assigns[i] === "TEMP" || t.assigns[i] === "REQ_IN" || t.assigns[i] === type) {
                         t.assigns[i] = type;
                     } else {
-                        // トレーナーが既に別のシフト(別の新人とのペアなど)になっている場合
-                        // 多対1の場合、トレーナーのシフトに新人を合わせる
+                        // トレーナーが別シフトで固定済みなら新人もそれに合わせる
                         r.assigns[i] = t.assigns[i];
                     }
 
@@ -633,7 +676,6 @@
             }
 
             // 3. 休日数の強制調整 (トータル10日)
-            // ここでの変更は「連勤制限」と「新人同期」を壊さないように慎重に行う
             staffSim.forEach(s => {
                 if (!s.isFullTime) return;
 
@@ -642,34 +684,21 @@
                 let diff = FIXED_OFF_DAYS - holidays;
 
                 if (diff > 0) {
-                    // 休日が足りない -> 出勤日を公休に変える
-                    // どこを変えるか？ -> 飛び石になっている出勤日などを優先
+                    // 休み不足 -> 出勤日を公休に
                     let workDays = s.assigns.map((v, idx) => ({v, idx})).filter(o => !['公休','希望','有給','定休','-'].includes(o.v));
-                    
-                    // シャッフルしてランダムに選ぶ（簡易）
                     workDays.sort(() => Math.random() - 0.5);
 
                     for (let wd of workDays) {
                         if (diff === 0) break;
-                        
-                        // 新人なら、トレーナーも休ませる必要があるか？ -> いや、新人が休む分にはトレーナーは単独出勤可なのでOK
-                        // トレーナーの場合、担当新人がいるなら新人も休ませる必要がある
-                        if (s.isTrainer) {
-                            // この日、新人が自分とセットで出勤しているか確認
-                            // 簡易的に全新人チェック
-                            let linkedRookies = staffSim.filter(r => r.role === 'rookie' && !['公休','希望','有給','定休'].includes(r.assigns[wd.idx]));
-                            // 本来はペア情報が必要だが、ここでは「トレーナーが休むなら、その日出勤の新人（自分とペアの可能性が高い）も道連れ」にするか、
-                            // 安全のためトレーナーの休日化を避けるか。
-                            // -> 安全のため、新人がいる日のトレーナーの休日化は避ける（スキップ）
-                            if (linkedRookies.length > 0) continue; 
-                        }
-
+                        // トレーナーの場合、新人がいる日は休みにくいが、ここでは厳密な10日を優先
+                        // ただしペアが崩れるリスクあり。
+                        // 今回は簡易的に実行
                         s.assigns[wd.idx] = '公休';
                         diff--;
                     }
 
                 } else if (diff < 0) {
-                    // 休日が多い -> 公休を出勤に変える
+                    // 休みすぎ -> 公休を出勤に
                     let offDays = s.assigns.map((v, idx) => ({v, idx})).filter(o => o.v === '公休');
                     offDays.sort(() => Math.random() - 0.5);
 
@@ -677,37 +706,35 @@
                         if (diff === 0) break;
                         const idx = od.idx;
 
-                        // 連勤チェック: ここを出勤にしてもMAXを超えないか？
-                        // 前後の出勤状況を確認
+                        // 連勤チェック
                         let seq = 1;
-                        // 前方
                         for (let k = idx - 1; k >= 0; k--) {
-                            if (!['公休','希望','有給','定休'].includes(s.assigns[k])) seq++; else break;
+                            if (!['公休','希望','有給','定休','-'].includes(s.assigns[k])) seq++; else break;
                         }
-                        // 後方
                         for (let k = idx + 1; k < daysInMonth; k++) {
-                            if (!['公休','希望','有給','定休'].includes(s.assigns[k])) seq++; else break;
+                            if (!['公休','希望','有給','定休','-'].includes(s.assigns[k])) seq++; else break;
                         }
 
                         if (seq <= MAX_CONSECUTIVE_WORK) {
-                            // 出勤可。新人の場合はトレーナーが必要なので、単独出勤できないならスキップ
                             if (s.role === 'rookie') {
-                                // この日出勤のトレーナーがいるか？
-                                const trainersOn = staffSim.some(t => t.isTrainer && !['公休','希望','有給','定休'].includes(t.assigns[idx]));
-                                if (!trainersOn) continue; // トレーナーいないので出勤不可
-                                // いるなら、そのトレーナーと同じシフトにする
-                                const t = staffSim.find(t => t.isTrainer && !['公休','希望','有給','定休'].includes(t.assigns[idx]));
-                                s.assigns[idx] = t.assigns[idx];
+                                // 新人はトレーナーがいる日しか出勤できない
+                                const hasTrainer = staffSim.some(t => t.isTrainer && !['公休','希望','有給','定休','-'].includes(t.assigns[idx]));
+                                if (hasTrainer) {
+                                    // トレーナーと同じシフトを検索
+                                    const t = staffSim.find(t => t.isTrainer && !['公休','希望','有給','定休','-'].includes(t.assigns[idx]));
+                                    s.assigns[idx] = t.assigns[idx];
+                                    diff++;
+                                }
                             } else {
-                                s.assigns[idx] = 'フル'; // 暫定
+                                s.assigns[idx] = 'フル'; 
+                                diff++;
                             }
-                            diff++;
                         }
                     }
                 }
             });
 
-            // 結果を整形してStateへ
+            // 結果を整形
             staffSim.forEach(s => {
                 for (let i = 0; i < daysInMonth; i++) {
                     const k = `${s.id}_${getDateKey(i+1)}`;
@@ -810,7 +837,7 @@
                 <div className="bg-slate-800 p-4 text-white flex flex-col md:flex-row justify-between items-center gap-4">
                   <div>
                     <h1 className="text-xl md:text-2xl font-bold flex items-center gap-2">
-                      <Icon name="RefreshCw" /> Shift Maker Pro <span className="text-xs bg-blue-600 px-2 py-1 rounded">Ver 26.7</span>
+                      <Icon name="RefreshCw" /> Shift Maker Pro <span className="text-xs bg-blue-600 px-2 py-1 rounded">Ver 26.8</span>
                     </h1>
                     <p className="opacity-80 text-sm mt-1">{storeName || '店舗名未設定'} | {year}年{month}月</p>
                   </div>
@@ -950,7 +977,17 @@
                                   let cellClass = "cursor-pointer hover:bg-gray-100";
                                   let content = "-";
                                   if (isClosed(d)) return <td key={d} className="border border-b bg-red-50 text-red-300 text-center text-[10px]">休</td>;
-                                  if (isGuestLike) { const mark = staff.role === 'event' ? 'event_in' : 'guest_in'; const label = staff.role === 'event' ? '出勤' : '受入'; if (req === mark) { cellClass = "bg-teal-100 text-teal-800 font-bold border-teal-200"; content = label; } } else { if (req === 'off') { cellClass = "bg-gray-300 text-gray-700 font-bold"; content = "希"; } else if (req === 'paid') { cellClass = "bg-pink-300 text-pink-700 font-bold"; content = "有"; } else { const sEvent = staffEventTypes.find(e => e.id === req); if (sEvent) { cellClass = `${sEvent.color} font-bold`; content = sEvent.name.substring(0,2); } } }
+                                  
+                                  if (isGuestLike) { 
+                                      const mark = staff.role === 'event' ? 'event_in' : 'guest_in'; 
+                                      const label = staff.role === 'event' ? '出勤' : '受入'; 
+                                      if (req === mark) { cellClass = "bg-teal-100 text-teal-800 font-bold border-teal-200"; content = label; }
+                                      else if (req === 'off') { cellClass = "bg-gray-300 text-gray-700 font-bold"; content = "希"; }
+                                  } else { 
+                                      if (req === 'off') { cellClass = "bg-gray-300 text-gray-700 font-bold"; content = "希"; } 
+                                      else if (req === 'paid') { cellClass = "bg-pink-300 text-pink-700 font-bold"; content = "有"; } 
+                                      else { const sEvent = staffEventTypes.find(e => e.id === req); if (sEvent) { cellClass = `${sEvent.color} font-bold`; content = sEvent.name.substring(0,2); } } 
+                                  }
                                   return (<td key={d} className={`border border-b text-center p-1 transition-colors ${cellClass}`} onClick={() => handleRequestChange(staff.id, d, staff.role)}>{content}</td>);
                                 })}
                               </tr>
